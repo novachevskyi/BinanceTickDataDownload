@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Convert Binance monthly trade files to Sierra Chart tick CSV format with Symbol column.
-FIXED VERSION with manual volume multiplier input.
+FIXED VERSION with manual volume multiplier input and handling for duplicate timestamps.
 
 Usage:
   1. Download monthly ZIP(s) from: https://data.binance.vision/
@@ -67,6 +67,9 @@ def main():
         writer.writerow(header)
         print(f"Writing to {output_file}")
 
+        last_dt = None
+        dup_count = 0
+
         for file in files:
             symbol = extract_symbol_from_filename(file)
             print(f"\nProcessing {os.path.basename(file)} (symbol: {symbol})")
@@ -106,8 +109,18 @@ def main():
                             
                             # Convert timestamp
                             dt = convert_timestamp_ms(ts_ms, tz_offset_hours=tz_offset)
-                            date_str = dt.strftime('%Y%m%d')
-                            time_str = dt.strftime('%H:%M:%S.%f')[:-3]  # milliseconds
+                            
+                            # Handle duplicate timestamps
+                            if dt == last_dt:
+                                dup_count += 1
+                                dt_for_output = dt + timedelta(microseconds=dup_count)
+                            else:
+                                dup_count = 0
+                                dt_for_output = dt
+                            last_dt = dt
+                            
+                            date_str = dt_for_output.strftime('%Y%m%d')
+                            time_str = dt_for_output.strftime('%H:%M:%S.%f')  # Full microseconds
                             
                             # For tick data, OHLC are all the same (the trade price)
                             last = price_f
@@ -154,7 +167,7 @@ def main():
                             print(f"Sample limit reached: {sample_limit}")
                             break
 
-                print(f"  Processed: {processed}, Written: {total_written - (total_written - processed + skipped)}, Skipped: {skipped}")
+                print(f"  Processed: {processed}, Written: {processed - skipped}, Skipped: {skipped}")
 
             except Exception as e:
                 print(f"  Error processing {file}: {e}")
