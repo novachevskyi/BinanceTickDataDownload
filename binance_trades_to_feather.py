@@ -30,19 +30,81 @@ def process_csv_chunk(csv_file: str, chunksize: int = 1000000) -> pd.DataFrame:
     total_rows = 0
     
     try:
-        # Read CSV in chunks
-        for chunk in pd.read_csv(csv_file, 
-                                 names=['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker'],
-                                 chunksize=chunksize):
-            chunks.append(chunk)
-            total_rows += len(chunk)
-            print(f"  Processed {total_rows:,} rows...", end='\r')
+        # First, check if file has headers
+        with open(csv_file, 'r') as f:
+            first_line = f.readline().strip()
+            has_header = 'id' in first_line.lower() or 'time' in first_line.lower()
+        
+        # Define dtypes to avoid mixed type warnings
+        dtypes = {
+            0: str,    # id
+            1: float,  # price
+            2: float,  # qty
+            3: float,  # quote_qty
+            4: str,    # time (will convert later)
+            5: str     # is_buyer_maker
+        }
+        
+        # Read CSV in chunks with appropriate settings
+        if has_header:
+            # File has headers, let pandas detect them
+            for chunk in pd.read_csv(csv_file, 
+                                     chunksize=chunksize,
+                                     dtype=dtypes):
+                chunks.append(chunk)
+                total_rows += len(chunk)
+                print(f"  Processed {total_rows:,} rows...", end='\r')
+        else:
+            # No headers, specify column names
+            for chunk in pd.read_csv(csv_file, 
+                                     names=['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker'],
+                                     chunksize=chunksize,
+                                     dtype=dtypes):
+                chunks.append(chunk)
+                total_rows += len(chunk)
+                print(f"  Processed {total_rows:,} rows...", end='\r')
         
         print(f"  Loaded {total_rows:,} trades from file")
-        return pd.concat(chunks, ignore_index=True)
+        
+        if not chunks:
+            return pd.DataFrame()
+        
+        df = pd.concat(chunks, ignore_index=True)
+        
+        # Ensure correct column names if they were detected
+        if has_header and len(df.columns) == 6:
+            # Map potential column variations to standard names
+            column_mapping = {}
+            for i, col in enumerate(df.columns):
+                col_lower = str(col).lower()
+                if 'id' in col_lower:
+                    column_mapping[col] = 'id'
+                elif 'price' in col_lower:
+                    column_mapping[col] = 'price'
+                elif 'qty' in col_lower or 'quantity' in col_lower:
+                    column_mapping[col] = 'qty'
+                elif 'quote' in col_lower:
+                    column_mapping[col] = 'quote_qty'
+                elif 'time' in col_lower:
+                    column_mapping[col] = 'time'
+                elif 'buyer' in col_lower or 'maker' in col_lower:
+                    column_mapping[col] = 'is_buyer_maker'
+            
+            if column_mapping:
+                df = df.rename(columns=column_mapping)
+        
+        # Ensure we have the expected columns
+        expected_cols = ['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker']
+        if not all(col in df.columns for col in expected_cols):
+            # If column names don't match, assume positional
+            df.columns = expected_cols
+        
+        return df
     
     except Exception as e:
         print(f"  Error reading {csv_file}: {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
 def convert_trades_to_freqtrade_format(df: pd.DataFrame) -> pd.DataFrame:
@@ -57,27 +119,49 @@ def convert_trades_to_freqtrade_format(df: pd.DataFrame) -> pd.DataFrame:
     """
     trades_df = pd.DataFrame()
     
-    # Timestamp in milliseconds
-    trades_df['timestamp'] = df['time'].astype(np.int64)
+    # Convert time to int64 (handle both string and numeric formats)
+    if df['time'].dtype == 'object':
+        trades_df['timestamp'] = pd.to_numeric(df['time'], errors='coerce').astype(np.int64)
+    else:
+        trades_df['timestamp'] = df['time'].astype(np.int64)
     
-    # Trade ID
+    # Trade ID (convert to string)
     trades_df['id'] = df['id'].astype(str)
     
     # Type: 'limit' for all trades
     trades_df['type'] = 'limit'
     
+    # Handle is_buyer_maker column (can be boolean, string, or numeric)
+    is_buyer_maker_col = df['is_buyer_maker']
+    
+    if is_buyer_maker_col.dtype == 'object':
+        # String type - handle 'true'/'false' or 'True'/'False'
+        is_buyer_maker_bool = is_buyer_maker_col.str.lower() == 'true'
+    elif is_buyer_maker_col.dtype == 'bool':
+        # Already boolean
+        is_buyer_maker_bool = is_buyer_maker_col
+    else:
+        # Numeric - convert to boolean
+        is_buyer_maker_bool = is_buyer_maker_col.astype(bool)
+    
     # Side: if is_buyer_maker is True, the taker was a seller (sell)
     # if is_buyer_maker is False, the taker was a buyer (buy)
-    trades_df['side'] = df['is_buyer_maker'].apply(lambda x: 'sell' if x else 'buy')
+    trades_df['side'] = is_buyer_maker_bool.apply(lambda x: 'sell' if x else 'buy')
     
-    # Price
-    trades_df['price'] = df['price'].astype(np.float64)
+    # Price (ensure float)
+    trades_df['price'] = pd.to_numeric(df['price'], errors='coerce').astype(np.float64)
     
     # Amount (base currency quantity)
-    trades_df['amount'] = df['qty'].astype(np.float64)
+    trades_df['amount'] = pd.to_numeric(df['qty'], errors='coerce').astype(np.float64)
     
     # Cost (quote currency amount)
-    trades_df['cost'] = df['quote_qty'].astype(np.float64)
+    trades_df['cost'] = pd.to_numeric(df['quote_qty'], errors='coerce').astype(np.float64)
+    
+    # Remove any rows with NaN values (from conversion errors)
+    initial_len = len(trades_df)
+    trades_df = trades_df.dropna()
+    if len(trades_df) < initial_len:
+        print(f"  Warning: Dropped {initial_len - len(trades_df)} invalid rows")
     
     # Sort by timestamp
     trades_df = trades_df.sort_values('timestamp')
@@ -204,11 +288,42 @@ def process_single_csv(csv_file: str, output_dir: str, pair: str = "BTC/USDT",
         print(f"  Large file detected, reading in chunks...")
         df = process_csv_chunk(csv_file)
     else:
-        df = pd.read_csv(csv_file, names=['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker'])
+        # Check if file has headers
+        with open(csv_file, 'r') as f:
+            first_line = f.readline().strip()
+            has_header = 'id' in first_line.lower() or 'time' in first_line.lower()
+        
+        # Define dtypes
+        dtypes = {
+            'id': str,
+            'price': float,
+            'qty': float,
+            'quote_qty': float,
+            'time': str,
+            'is_buyer_maker': str
+        }
+        
+        if has_header:
+            df = pd.read_csv(csv_file, dtype=dtypes)
+            # Ensure correct column names
+            if 'id' not in df.columns and len(df.columns) == 6:
+                df.columns = ['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker']
+        else:
+            df = pd.read_csv(csv_file, names=['id', 'price', 'qty', 'quote_qty', 'time', 'is_buyer_maker'],
+                           dtype={'id': str, 'price': float, 'qty': float, 
+                                  'quote_qty': float, 'time': str, 'is_buyer_maker': str})
+        
         print(f"  Loaded {len(df):,} trades")
     
     if df.empty:
         return None
+    
+    # Show sample of data for verification
+    print(f"  Data sample (first row):")
+    print(f"    id: {df.iloc[0]['id']}")
+    print(f"    price: {df.iloc[0]['price']}")
+    print(f"    time: {df.iloc[0]['time']}")
+    print(f"    is_buyer_maker: {df.iloc[0]['is_buyer_maker']}")
     
     # Convert to Freqtrade format
     trades_df = convert_trades_to_freqtrade_format(df)
@@ -353,11 +468,11 @@ def main():
     # ============================================
     
     # Input: Folder containing Binance CSV files OR single CSV file
-    INPUT_PATH = "/path/to/your/binance/csv/folder"  # Folder with CSVs
+    INPUT_PATH = "/home/novachevskyi/binancedata/temp_binance/futures/um/daily/trades/BTCUSDT"  # Folder with CSVs
     # INPUT_PATH = "/path/to/single/file.csv"  # Or single file
     
     # Output: Path to your Freqtrade installation
-    FREQTRADE_DIR = "/path/to/freqtrade"
+    FREQTRADE_DIR = "/home/novachevskyi/freqtrade"  # Update this to your actual path
     OUTPUT_DIR = f"{FREQTRADE_DIR}/user_data/data"
     
     # Trading pair (must match what you'll use in strategy)
@@ -384,12 +499,27 @@ def main():
     print("=" * 60)
     print("Binance to Freqtrade Data Converter")
     print("=" * 60)
+    print(f"\nSettings:")
+    print(f"  Input: {INPUT_PATH}")
+    print(f"  Output: {OUTPUT_DIR}")
+    print(f"  Pair: {PAIR}")
+    print(f"  Exchange: {EXCHANGE}")
+    print(f"  Combine files: {COMBINE_FILES}")
+    print(f"  Create OHLCV: {CREATE_OHLCV}")
+    print(f"  Timeframes: {TIMEFRAMES}")
+    print("")
     
     input_path = Path(INPUT_PATH)
+    output_path = Path(OUTPUT_DIR)
     
     if not input_path.exists():
         print(f"Error: Input path does not exist: {INPUT_PATH}")
         sys.exit(1)
+    
+    # Create output directory if it doesn't exist
+    if not output_path.exists():
+        print(f"Creating output directory: {OUTPUT_DIR}")
+        output_path.mkdir(parents=True, exist_ok=True)
     
     # Check if input is a folder or file
     if input_path.is_dir():
