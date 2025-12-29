@@ -1,6 +1,8 @@
 # BinanceTickDataDownload
 Downloads data from Binance archives and converts to CSV format supported by Sierra Chart and Freqtrade.
 
+https://orderflowtriggers.gumroad.com/l/scbinance
+
 ## Freqtrade conversion
 
 How to Use
